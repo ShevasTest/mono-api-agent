@@ -74,9 +74,18 @@ export const REASONING_TOKEN_FLOOR = 700;
  * Groq стоїть першим: він помітно швидший за безкоштовні пули OpenRouter,
  * і якщо ключ дійсний, ланцюжок навіть не дійде до решти.
  */
+/**
+ * Ланцюжок для вузла route — потрібен строгий JSON.
+ *
+ * Порядок за виміряною швидкістю: після переходу самоперевірки на
+ * детермінований механізм цей ланцюжок обслуговує лише класифікацію
+ * питання, тобто найпростіше можливе завдання. Тут важить не глибина
+ * моделі, а затримка, і llama-3.1-8b-instant дає 249 мс проти 5–17 секунд
+ * у безкоштовних пулів OpenRouter.
+ */
 export const JSON_CHAIN: ModelSpec[] = [
+  groq("llama-3.1-8b-instant"),
   groq("llama-3.3-70b-versatile"),
-  groq("openai/gpt-oss-120b"),
   // gemma віддає рівно `{"needsLiveData": false}` за 7 токенів — для
   // класифікації це ідеал, тому серед безкоштовних вона перша.
   or("google/gemma-4-26b-a4b-it:free"),
@@ -94,7 +103,11 @@ export const JSON_CHAIN: ModelSpec[] = [
  */
 export const PROSE_CHAIN: ModelSpec[] = [
   groq("llama-3.3-70b-versatile"),
-  groq("openai/gpt-oss-120b"),
+  // Ці три на Groq відповідають 400 на response_format («Failed to validate
+  // JSON»), тож json-режим їм не надсилаємо взагалі. Для прози вони придатні.
+  groq("openai/gpt-oss-120b", { supportsJsonMode: false }),
+  groq("qwen/qwen3.6-27b", { supportsJsonMode: false }),
+  groq("llama-3.1-8b-instant"),
   or("nvidia/nemotron-3-nano-30b-a3b:free", { reasoning: true }),
   or("google/gemma-4-26b-a4b-it:free"),
   or("nvidia/nemotron-3-super-120b-a12b:free", { reasoning: true }),

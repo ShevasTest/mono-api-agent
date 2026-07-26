@@ -1,8 +1,15 @@
 /**
  * Мінімальний .env-лоадер — щоб не тягти залежність заради двадцяти рядків.
  *
- * Свідомо не перезаписує вже наявні змінні оточення: значення, передане
- * явно в командному рядку, має бути сильнішим за файл.
+ * Файл має пріоритет над оточенням, і це свідомий відхід від звичної
+ * поведінки dotenv. Причина не теоретична: у шелі користувача був
+ * експортований застарілий GROQ_API_KEY тієї ж довжини, що й новий. Файл
+ * .env мовчки програвав йому, кожен запит отримував 401, і виглядало це
+ * як «провайдер не працює», а не як «ключ береться не звідти».
+ *
+ * Мовчазне затінення конфігурації — найгірший різновид помилки: вона
+ * маскується під чужу. Тому файл перемагає, а про кожне перекриття
+ * повідомляється.
  */
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -32,10 +39,51 @@ export function parseDotEnv(content: string): Record<string, string> {
   return result;
 }
 
-export async function loadDotEnv(file = ".env"): Promise<void> {
-  if (!existsSync(file)) return;
+export interface LoadDotEnvOptions {
+  /** false — лишити значення з оточення недоторканими (класична поведінка dotenv). */
+  override?: boolean;
+  env?: NodeJS.ProcessEnv;
+}
 
-  for (const [key, value] of Object.entries(parseDotEnv(await readFile(file, "utf8")))) {
-    if (process.env[key] === undefined) process.env[key] = value;
+export interface LoadDotEnvResult {
+  /** Ключі, взяті з файлу. */
+  applied: string[];
+  /** Ключі, де файл перекрив інше значення з оточення. */
+  overridden: string[];
+}
+
+export function applyDotEnv(
+  values: Record<string, string>,
+  { override = true, env = process.env }: LoadDotEnvOptions = {},
+): LoadDotEnvResult {
+  const applied: string[] = [];
+  const overridden: string[] = [];
+
+  for (const [key, value] of Object.entries(values)) {
+    const existing = env[key];
+
+    if (existing === undefined) {
+      env[key] = value;
+      applied.push(key);
+      continue;
+    }
+
+    if (existing === value) continue;
+    if (!override) continue;
+
+    env[key] = value;
+    applied.push(key);
+    overridden.push(key);
   }
+
+  return { applied, overridden };
+}
+
+export async function loadDotEnv(
+  file = ".env",
+  options: LoadDotEnvOptions = {},
+): Promise<LoadDotEnvResult> {
+  if (!existsSync(file)) return { applied: [], overridden: [] };
+
+  return applyDotEnv(parseDotEnv(await readFile(file, "utf8")), options);
 }

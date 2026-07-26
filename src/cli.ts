@@ -10,7 +10,13 @@ import { isFakeMode } from "./reason.ts";
 import { JSON_CHAIN, PROSE_CHAIN, specLabel } from "./providers.ts";
 
 async function main() {
-  await loadDotEnv();
+  const env = await loadDotEnv();
+  if (env.overridden.length > 0) {
+    console.log(
+      `ℹ️  .env перекрив значення з оточення: ${env.overridden.join(", ")}` +
+        " (у шелі лежало інше — файл має пріоритет)\n",
+    );
+  }
 
   const args = process.argv.slice(2);
   const showTrace = args.includes("--trace");

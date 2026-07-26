@@ -349,6 +349,37 @@ describe("обрив по ліміту токенів", () => {
     assert.equal(result.text, '{"ok":1}');
   });
 
+  it("для JSON обрив приймається, якщо відповідь усе одно розбирається", async () => {
+    // llama-3.1-8b-instant віддає валідний JSON із переносами й впирається
+    // в стелю рівно на закривальній дужці. Викидати такий результат означало
+    // б втратити найшвидшу модель ланцюжка на порожньому місці.
+    const h = makeHarness();
+    h.setResponder(() => ok('{\n  "needsLiveData": false\n}', "length"));
+
+    const result = await h.client.chat({ ...PROMPT, json: true });
+
+    assert.equal(result.spec, JSON_CHAIN[0]);
+    assert.equal(h.requests.length, 1, "другої спроби бути не мало");
+  });
+
+  it("для JSON обрив НЕ приймається, якщо відповідь розсипалась", async () => {
+    const h = makeHarness();
+    h.setResponder((_req, i) => (i === 0 ? ok('{"ne', "length") : ok('{"ok":1}')));
+
+    const result = await h.client.chat({ ...PROMPT, json: true });
+
+    assert.equal(result.text, '{"ok":1}');
+    assert.ok(h.requests.length > 1);
+  });
+
+  it("для прози обрив завжди вважається збоєм", async () => {
+    const h = makeHarness();
+    h.setResponder((_req, i) => (i === 0 ? ok("речення обірване на пів", "length") : ok("ціле")));
+
+    const result = await h.client.chat(PROMPT);
+    assert.equal(result.text, "ціле");
+  });
+
   it("повтор після обриву йде з більшим бюджетом токенів", async () => {
     const h = makeHarness();
     h.setResponder((_req, i) => (i === 0 ? ok("обрізок", "length") : ok("повний")));

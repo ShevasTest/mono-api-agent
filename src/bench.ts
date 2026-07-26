@@ -186,7 +186,10 @@ async function evaluate(candidate: Candidate): Promise<Result> {
 }
 
 async function main() {
-  await loadDotEnv();
+  const env = await loadDotEnv();
+  if (env.overridden.length > 0) {
+    console.log(`ℹ️  .env перекрив значення з оточення: ${env.overridden.join(", ")}`);
+  }
 
   console.log(`Перевіряю ${CANDIDATES.length} моделей…\n`);
   const results: Result[] = [];

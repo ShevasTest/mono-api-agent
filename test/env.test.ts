@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { parseDotEnv } from "../src/env.ts";
+import { applyDotEnv, parseDotEnv } from "../src/env.ts";
 
 describe("parseDotEnv", () => {
   it("читає прості пари", () => {
@@ -52,5 +52,65 @@ describe("parseDotEnv", () => {
 
   it("порожній файл дає порожній об'єкт", () => {
     assert.deepEqual(parseDotEnv(""), {});
+  });
+});
+
+describe("applyDotEnv", () => {
+  it("ставить значення, якщо в оточенні його немає", () => {
+    const env = {} as NodeJS.ProcessEnv;
+    const result = applyDotEnv({ A: "1" }, { env });
+
+    assert.equal(env.A, "1");
+    assert.deepEqual(result.applied, ["A"]);
+    assert.deepEqual(result.overridden, []);
+  });
+
+  it("файл перекриває застаріле значення з оточення", () => {
+    // Саме цей випадок ламав усе: у шелі лежав старий GROQ_API_KEY тієї ж
+    // довжини, і .env мовчки програвав йому, даючи 401 на кожному запиті.
+    const env = { GROQ_API_KEY: "старий" } as NodeJS.ProcessEnv;
+    const result = applyDotEnv({ GROQ_API_KEY: "новий" }, { env });
+
+    assert.equal(env.GROQ_API_KEY, "новий");
+    assert.deepEqual(result.overridden, ["GROQ_API_KEY"]);
+  });
+
+  it("перекриття явно повідомляється — мовчки затінювати конфіг не можна", () => {
+    const env = { A: "старе", B: "те саме" } as NodeJS.ProcessEnv;
+    const result = applyDotEnv({ A: "нове", B: "те саме", C: "новий" }, { env });
+
+    assert.deepEqual(result.overridden, ["A"]);
+    assert.deepEqual(result.applied.sort(), ["A", "C"]);
+  });
+
+  it("однакове значення не вважається перекриттям", () => {
+    const env = { A: "1" } as NodeJS.ProcessEnv;
+    const result = applyDotEnv({ A: "1" }, { env });
+
+    assert.deepEqual(result.overridden, []);
+    assert.deepEqual(result.applied, []);
+  });
+
+  it("override:false повертає класичну поведінку dotenv", () => {
+    const env = { A: "з оточення" } as NodeJS.ProcessEnv;
+    const result = applyDotEnv({ A: "з файлу" }, { env, override: false });
+
+    assert.equal(env.A, "з оточення");
+    assert.deepEqual(result.overridden, []);
+  });
+
+  it("override:false усе одно ставить відсутні ключі", () => {
+    const env = {} as NodeJS.ProcessEnv;
+    applyDotEnv({ A: "з файлу" }, { env, override: false });
+
+    assert.equal(env.A, "з файлу");
+  });
+
+  it("порожній набір нічого не змінює", () => {
+    const env = { A: "1" } as NodeJS.ProcessEnv;
+    const result = applyDotEnv({}, { env });
+
+    assert.equal(env.A, "1");
+    assert.deepEqual(result.applied, []);
   });
 });

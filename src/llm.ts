@@ -221,6 +221,7 @@ export class LlmClient {
     options: ChatOptions,
     useJsonMode: boolean,
     maxTokens: number,
+    expectJson: boolean,
   ): Promise<{ text: string; promptTokens: number; completionTokens: number }> {
     const provider = PROVIDERS[spec.provider];
     const apiKey = this.deps.env[provider.envKey];
@@ -268,13 +269,22 @@ export class LlmClient {
       throw Object.assign(new Error("порожня відповідь"), { kind: "empty" as FailureKind });
     }
 
-    // Обрив по ліміту токенів — це зіпсована відповідь, а не відповідь.
-    // Мовчки приймати її не можна: для JSON це гарантований збій парсингу,
-    // для прози — обрізане на півслові речення.
+    // Обрив по ліміту токенів зазвичай означає зіпсовану відповідь: для
+    // прози — речення, обірване на півслові.
+    //
+    // Але не завжди. `llama-3.1-8b-instant` віддає валідний
+    // `{\n  "needsLiveData": false\n}` і впирається в стелю рівно на
+    // закривальній дужці — форматування з переносами з'їдає останні токени.
+    // Перша версія цієї перевірки викидала такий цілком придатний результат
+    // і йшла до наступної моделі, втрачаючи сім разів по швидкості.
+    // Тому для JSON вирішує не finish_reason, а те, чи розбирається відповідь.
     if (choice?.finish_reason === "length") {
-      throw Object.assign(new Error("відповідь обрізано по ліміту токенів"), {
-        kind: "truncated" as FailureKind,
-      });
+      const salvageable = expectJson && extractJson(text) !== undefined;
+      if (!salvageable) {
+        throw Object.assign(new Error("відповідь обрізано по ліміту токенів"), {
+          kind: "truncated" as FailureKind,
+        });
+      }
     }
 
     return {
@@ -316,6 +326,7 @@ export class LlmClient {
             options,
             useJsonMode,
             this.budgetFor(spec, options.maxTokens ?? 1200, retryBoost),
+            Boolean(options.json),
           );
 
           metrics.recordCall({
