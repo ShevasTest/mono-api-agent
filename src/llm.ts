@@ -7,6 +7,8 @@
  */
 import OpenAI from "openai";
 
+import { metrics } from "./metrics.ts";
+
 export interface Provider {
   name: string;
   baseURL?: string;
@@ -112,6 +114,7 @@ export async function chat({
 
   const { client: openai, provider: active } = getClient();
 
+  const started = Date.now();
   const completion = await openai.chat.completions.create({
     model: active.model,
     temperature,
@@ -120,6 +123,13 @@ export async function chat({
       { role: "system", content: system },
       { role: "user", content: user },
     ],
+  });
+
+  metrics.recordCall({
+    model: active.model,
+    promptTokens: completion.usage?.prompt_tokens ?? 0,
+    completionTokens: completion.usage?.completion_tokens ?? 0,
+    durationMs: Date.now() - started,
   });
 
   return completion.choices[0]?.message?.content?.trim() ?? "";

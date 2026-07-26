@@ -27,6 +27,7 @@ import { END, START, ReducedValue, StateGraph, StateSchema } from "@langchain/la
 import * as z from "zod";
 
 import { chat, chatJson } from "./llm.ts";
+import { instrument, metrics } from "./metrics.ts";
 import { formatContext, search, type Hit } from "./retrieve.ts";
 import { getCurrencyRates } from "./tools.ts";
 
@@ -146,11 +147,11 @@ async function verify(state: State) {
 }
 
 export const graph = new StateGraph(AgentState)
-  .addNode("route", route)
-  .addNode("fetchLive", fetchLive)
-  .addNode("retrieve", retrieve)
-  .addNode("generate", generate)
-  .addNode("verify", verify)
+  .addNode("route", instrument("route", route))
+  .addNode("fetchLive", instrument("fetchLive", fetchLive))
+  .addNode("retrieve", instrument("retrieve", retrieve))
+  .addNode("generate", instrument("generate", generate))
+  .addNode("verify", instrument("verify", verify))
   .addEdge(START, "route")
   .addConditionalEdges("route", (state: State) =>
     state.verdict === "live" ? "fetchLive" : "retrieve",
@@ -168,9 +169,12 @@ export interface AskResult {
   sources: string[];
   trace: string[];
   attempts: number;
+  /** Час, виклики моделі й токени по вузлах графа. */
+  metrics: string;
 }
 
 export async function ask(question: string): Promise<AskResult> {
+  metrics.reset();
   const final = (await graph.invoke({ question })) as State;
 
   return {
@@ -178,5 +182,6 @@ export async function ask(question: string): Promise<AskResult> {
     sources: final.sources,
     trace: final.trace,
     attempts: final.attempts,
+    metrics: metrics.report(),
   };
 }

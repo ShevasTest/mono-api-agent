@@ -51,6 +51,9 @@ async function main() {
   if (showTrace) {
     console.log(`\n— хід графа (проходів пошуку: ${result.attempts}):`);
     for (const step of result.trace) console.log(`  → ${step}`);
+
+    console.log(`\n— вартість проходу:`);
+    console.log(result.metrics);
   }
 }
 
