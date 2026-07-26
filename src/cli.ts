@@ -1,65 +1,103 @@
 /**
  * CLI: npm run ask -- "як створити інвойс і перевірити його статус?"
  *
- * Прапорець --trace показує, як граф ходив по вузлах.
+ * Прапорець --trace показує, як граф ходив по вузлах і скільки це коштувало.
+ *
+ * Вивід влаштований так, щоб відповідь було видно з першого погляду:
+ * усе службове приглушене, акцент лишається на тексті, який людина
+ * прийшла прочитати.
  */
 import { ask } from "./agent.ts";
 import { loadDotEnv } from "./env.ts";
 import { llm } from "./llm.ts";
-import { isFakeMode } from "./reason.ts";
 import { JSON_CHAIN, PROSE_CHAIN, specLabel } from "./providers.ts";
+import { isFakeMode } from "./reason.ts";
+import { CURRENCY_URL } from "./tools.ts";
+import { Ui } from "./ui.ts";
+
+const ui = new Ui();
+
+function printPreamble(overridden: string[]) {
+  for (const key of overridden) {
+    console.log(ui.dim(`  .env перекрив ${key} — у шелі лежало інше значення`));
+  }
+
+  if (isFakeMode()) {
+    console.log(ui.warn("  офлайн-режим: модель не викликається"));
+    return;
+  }
+
+  if (!llm.hasAnyKey()) {
+    console.log(
+      ui.warn("  ключів нема — відповідь буде зібрана з документації без моделі"),
+    );
+    return;
+  }
+
+  const prose = llm.availableModels(PROSE_CHAIN);
+  const json = llm.availableModels(JSON_CHAIN);
+  const first = prose[0];
+
+  console.log(
+    ui.dim(
+      `  ключів ${llm.configuredKeyCount()} · моделей ${prose.length}/${PROSE_CHAIN.length} ` +
+        `(JSON ${json.length}/${JSON_CHAIN.length})` +
+        (first ? ` · перша в черзі ${specLabel(first)}` : ""),
+    ),
+  );
+}
 
 async function main() {
   const env = await loadDotEnv();
-  if (env.overridden.length > 0) {
-    console.log(
-      `ℹ️  .env перекрив значення з оточення: ${env.overridden.join(", ")}` +
-        " (у шелі лежало інше — файл має пріоритет)\n",
-    );
-  }
 
   const args = process.argv.slice(2);
   const showTrace = args.includes("--trace");
   const question = args.filter((arg) => !arg.startsWith("--")).join(" ").trim();
 
   if (!question) {
-    console.error('Використання: npm run ask -- "твоє питання" [--trace]');
+    console.error(ui.err('Використання: npm run ask -- "твоє питання" [--trace]'));
     process.exit(1);
   }
 
-  if (isFakeMode()) {
-    console.log("режим: офлайн (модель не викликається)\n");
-  } else if (!llm.hasAnyKey()) {
-    console.log(
-      "⚠️  нема жодного ключа (GROQ_API_KEY / OPENROUTER_API_KEY) — " +
-        "відповідь буде зібрана з документації без моделі\n",
-    );
-  } else {
-    const available = llm.availableModels(PROSE_CHAIN);
-    console.log(
-      `доступно моделей: ${available.length} із ${PROSE_CHAIN.length}` +
-        (available[0] ? `, перша в черзі — ${specLabel(available[0])}` : "") +
-        `\n(JSON-ланцюжок: ${llm.availableModels(JSON_CHAIN).length} із ${JSON_CHAIN.length})\n`,
-    );
-  }
+  printPreamble(env.overridden);
 
   const result = await ask(question);
 
-  console.log(result.answer);
+  console.log(ui.section("Відповідь"));
+  console.log();
+  console.log(ui.renderAnswer(result.answer));
 
-  console.log(`\n— джерела (${result.sources.length}):`);
-  for (const source of result.sources) console.log(`  · ${source}`);
+  // У гілці живих даних відповідь приходить із виклику API, а не з
+  // документації — показувати знайдені чанки як джерело було б оманою.
+  console.log(ui.section("Джерела"));
+  if (result.usedLiveData) {
+    console.log(`  ${ui.ok("●")} живий виклик ${ui.accent(CURRENCY_URL)}`);
+    console.log(ui.dim(`    (додатково знайдено в документації: ${result.sources.length})`));
+  } else {
+    for (const source of result.sources) {
+      console.log(`  ${ui.dim("·")} ${ui.accent(source)}`);
+    }
+  }
+
+  if (result.degraded) {
+    console.log(ui.warn("\n  ⚠ відповідь зібрана без моделі — жодна не була доступна"));
+  }
 
   if (showTrace) {
-    console.log(`\n— хід графа (проходів пошуку: ${result.attempts}):`);
-    for (const step of result.trace) console.log(`  → ${step}`);
+    console.log(ui.section(`Хід графа (проходів пошуку: ${result.attempts})`));
+    for (const step of result.trace) {
+      const [node, ...rest] = step.split(":");
+      console.log(`  ${ui.dim("→")} ${ui.bold(node ?? "")}${rest.length ? ":" : ""}${ui.dim(rest.join(":"))}`);
+    }
 
-    console.log(`\n— вартість проходу:`);
-    console.log(result.metrics);
+    console.log(ui.section("Вартість проходу"));
+    console.log(ui.dim(result.metrics));
   }
+
+  console.log();
 }
 
 main().catch((error) => {
-  console.error("✗", error instanceof Error ? error.message : error);
+  console.error(ui.err(`✗ ${error instanceof Error ? error.message : error}`));
   process.exit(1);
 });

@@ -242,6 +242,8 @@ export const graph = new StateGraph(AgentState)
 export interface AskResult {
   answer: string;
   sources: string[];
+  /** Відповідь спиралась на живий виклик API, а не лише на документацію. */
+  usedLiveData: boolean;
   trace: string[];
   attempts: number;
   degraded: boolean;
@@ -266,6 +268,7 @@ export async function ask(question: string): Promise<AskResult> {
     return {
       answer: final.answer,
       sources: final.sources,
+      usedLiveData: Boolean(final.liveData),
       trace: [...notes.map((n) => `вхід: ${n}`), ...final.trace],
       attempts: final.attempts,
       degraded: final.degraded,
