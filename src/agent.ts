@@ -51,6 +51,8 @@ export const AgentState = new StateSchema({
   verdict: z.string().default(""),
   /** true — відповідь зібрана без моделі. */
   degraded: z.boolean().default(false),
+  /** true — жодна модель не дописала відповідь до кінця. */
+  truncated: z.boolean().default(false),
   attempts: new ReducedValue(z.number().default(0), {
     reducer: (current: number, update: number) => current + update,
   }),
@@ -137,8 +139,18 @@ async function generate(state: State) {
     .join("\n");
 
   try {
-    const { text, via } = await reason({ system: ANSWER_SYSTEM, user });
-    return { answer: text, degraded: false, trace: [`generate: відповідь складено [${via}]`] };
+    const { text, via, truncated } = await reason({ system: ANSWER_SYSTEM, user });
+
+    return {
+      answer: text,
+      degraded: false,
+      truncated,
+      trace: [
+        truncated
+          ? `generate: жодна модель не дописала до кінця, віддано найповнішу [${via}]`
+          : `generate: відповідь складено [${via}]`,
+      ],
+    };
   } catch (error) {
     if (!(error instanceof AllModelsFailedError)) throw error;
 
@@ -159,6 +171,13 @@ async function verify(state: State) {
   // складається лише з фрагментів специфікації.
   if (state.degraded) {
     return { verdict: "ok", trace: ["verify: пропущено (відповідь без моделі)"] };
+  }
+
+  // Обрізану відповідь теж не женемо через цикл уточнення: справа не в
+  // поганому контексті, а в тому, що моделі не дописали. Повторний пошук
+  // тут нічого не полагодить, лише витратить час.
+  if (state.truncated) {
+    return { verdict: "ok", trace: ["verify: пропущено (відповідь обірвана по токенах)"] };
   }
 
   const report = checkGrounding(state.answer, state.context, state.question);

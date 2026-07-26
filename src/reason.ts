@@ -20,18 +20,32 @@ export interface ReasonResult {
   text: string;
   /** Яка саме модель відповіла — потрапляє у трасування. */
   via: string;
+  /** Жодна модель не дала цілої відповіді; ця — найповніша з обрізаних. */
+  truncated: boolean;
 }
+
+/** Приписка до обрізаної відповіді — читач має бачити, що текст неповний. */
+export const TRUNCATION_NOTICE =
+  "\n\n⚠️ Відповідь обірвалась по ліміту токенів моделі й показана неповністю. " +
+  "Спробуй перепитати вужче — по одному методу за раз.";
 
 export async function reason(options: ChatOptions): Promise<ReasonResult> {
   if (isFakeMode()) {
     return {
       text: `[офлайн-заглушка] Модель не викликалась. У контекст потрапило ${options.user.length} символів.`,
       via: "offline-stub",
+      truncated: false,
     };
   }
 
   const result = await llm.chat(options);
-  return { text: result.text, via: `${result.spec.provider}/${result.spec.model}` };
+  const truncated = result.truncated === true;
+
+  return {
+    text: truncated ? `${result.text}${TRUNCATION_NOTICE}` : result.text,
+    via: `${result.spec.provider}/${result.spec.model}`,
+    truncated,
+  };
 }
 
 export interface ReasonJsonResult<T> {

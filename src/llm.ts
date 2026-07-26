@@ -39,11 +39,41 @@ export type FailureKind =
   | "model_missing"
   | "bad_request"
   | "rate_limit"
+  | "quota_exhausted"
+  | "context_overflow"
   | "server"
   | "network"
   | "timeout"
   | "empty"
   | "truncated";
+
+/**
+ * Ознаки того, що провайдер відмовив саме через завеликий вхід.
+ *
+ * Це принципово інша ситуація, ніж «модель зламана»: тут винен не провайдер,
+ * а наш запит, і лікується вона стисканням контексту, а не переходом до
+ * наступної моделі. Формулювання в різних провайдерів різні, тому шукаємо
+ * за набором ознак.
+ */
+const CONTEXT_OVERFLOW_HINTS = [
+  "context length",
+  "context_length",
+  "context window",
+  "maximum context",
+  "too many tokens",
+  "reduce the length",
+  "input is too long",
+  "prompt is too long",
+  "request too large",
+];
+
+/** Ознаки вичерпаної денної/місячної квоти, а не миттєвого сплеску. */
+const QUOTA_HINTS = ["per-day", "per day", "daily limit", "quota", "credits", "monthly"];
+
+function matchesAny(haystack: string, needles: readonly string[]): boolean {
+  const lower = haystack.toLowerCase();
+  return needles.some((needle) => lower.includes(needle));
+}
 
 export interface AttemptLog {
   spec: string;
@@ -78,6 +108,8 @@ export interface LlmConfig {
   breakerThreshold: number;
   /** Наскільки запобіжник лишається розімкненим, мс. */
   breakerCooldownMs: number;
+  /** Вистигання для вичерпаної денної квоти — воно значно довше. */
+  quotaCooldownMs: number;
 }
 
 export const DEFAULT_CONFIG: LlmConfig = {
@@ -88,6 +120,7 @@ export const DEFAULT_CONFIG: LlmConfig = {
   totalDeadlineMs: 120_000,
   breakerThreshold: 2,
   breakerCooldownMs: 60_000,
+  quotaCooldownMs: 6 * 60 * 60 * 1000,
 };
 
 export interface LlmDeps {
@@ -111,6 +144,40 @@ export interface ChatResult {
   text: string;
   spec: ModelSpec;
   attempts: AttemptLog[];
+  /** true — жодна модель не дала цілої відповіді, віддано найповнішу обрізану. */
+  truncated?: boolean;
+}
+
+/** Стеля нарощування бюджету токенів — за нею почнеться 400 від самої моделі. */
+export const MAX_RETRY_BOOST = 8;
+
+/** Скільки разів поспіль стискати контекст, перш ніж визнати модель непридатною. */
+export const MAX_SHRINK_LEVEL = 2;
+
+/** На кожному рівні стискання лишаємо цю частку тексту. */
+const SHRINK_RATIO = 0.5;
+
+/**
+ * Стискає користувацьку частину запиту при переповненні контексту.
+ *
+ * Ріжемо з середини, а не з кінця: на початку — найрелевантніші джерела,
+ * а в самому кінці — питання користувача, без якого запит безглуздий.
+ */
+export function shrinkOptions(options: ChatOptions, level: number): ChatOptions {
+  const keepRatio = SHRINK_RATIO ** level;
+  const target = Math.max(500, Math.floor(options.user.length * keepRatio));
+  if (options.user.length <= target) return options;
+
+  const headSize = Math.floor(target * 0.7);
+  const tailSize = target - headSize;
+
+  const head = options.user.slice(0, headSize);
+  const tail = options.user.slice(options.user.length - tailSize);
+
+  return {
+    ...options,
+    user: `${head}\n\n… (контекст скорочено, щоб уміститись у вікно моделі) …\n\n${tail}`,
+  };
 }
 
 interface BreakerState {
@@ -250,20 +317,57 @@ export class LlmClient {
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
+
+      // Тіло відповіді уточнює діагноз там, де код статусу занадто грубий:
+      // 400 буває і «модель не вміє json», і «ти надіслав забагато тексту»,
+      // а 429 — і миттєвий сплеск, і вичерпана денна квота.
+      let kind = classifyStatus(response.status);
+      if (kind === "bad_request" && matchesAny(body, CONTEXT_OVERFLOW_HINTS)) {
+        kind = "context_overflow";
+      } else if (kind === "rate_limit" && matchesAny(body, QUOTA_HINTS)) {
+        kind = "quota_exhausted";
+      }
+
       throw Object.assign(new Error(`HTTP ${response.status} ${body.slice(0, 160)}`), {
-        kind: classifyStatus(response.status),
+        kind,
         status: response.status,
         retryAfterMs: parseRetryAfter(response.headers?.get?.("retry-after") ?? null),
       });
     }
 
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+    let data: {
+      choices?: Array<{
+        message?: { content?: string; reasoning?: string };
+        finish_reason?: string;
+      }>;
+      error?: { message?: string };
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
 
+    try {
+      data = (await response.json()) as typeof data;
+    } catch {
+      // Буває: проксі віддав 200 з HTML-заглушкою замість JSON.
+      throw Object.assign(new Error("відповідь не є JSON"), { kind: "empty" as FailureKind });
+    }
+
+    // Частина провайдерів OpenRouter повертає помилку зі статусом 200,
+    // сховавши її в тіло. Без цієї перевірки вона виглядала б як порожня
+    // відповідь і з'їдала б обидві спроби моделі.
+    if (data.error?.message && !data.choices?.length) {
+      const message = data.error.message;
+      throw Object.assign(new Error(`помилка в тілі 200: ${message.slice(0, 160)}`), {
+        kind: matchesAny(message, CONTEXT_OVERFLOW_HINTS)
+          ? ("context_overflow" as FailureKind)
+          : ("server" as FailureKind),
+      });
+    }
+
     const choice = data.choices?.[0];
-    const text = choice?.message?.content?.trim() ?? "";
+
+    // Reasoning-моделі іноді вивалюють усе в поле roздумів і лишають content
+    // порожнім. Викидати таку відповідь шкода — там може бути готовий результат.
+    const text = (choice?.message?.content?.trim() || choice?.message?.reasoning?.trim()) ?? "";
 
     if (!text) {
       throw Object.assign(new Error("порожня відповідь"), { kind: "empty" as FailureKind });
@@ -281,8 +385,11 @@ export class LlmClient {
     if (choice?.finish_reason === "length") {
       const salvageable = expectJson && extractJson(text) !== undefined;
       if (!salvageable) {
+        // Текст усе одно передаємо: якщо жодна модель не дасть цілої
+        // відповіді, обрізана — усе ще краще за дамп документації.
         throw Object.assign(new Error("відповідь обрізано по ліміту токенів"), {
           kind: "truncated" as FailureKind,
+          partialText: text,
         });
       }
     }
@@ -299,6 +406,13 @@ export class LlmClient {
     const attempts: AttemptLog[] = [];
     const deadline = this.deps.now() + this.config.totalDeadlineMs;
 
+    /**
+     * Найкраще, що вдалося отримати, навіть якщо воно неідеальне.
+     * Обрізана на 90% відповідь — це все одно відповідь, і вона незрівнянно
+     * корисніша за дамп специфікації, до якого граф падає в самому кінці.
+     */
+    let bestEffort: { text: string; spec: ModelSpec } | undefined;
+
     for (const spec of this.availableModels(chain)) {
       const label = specLabel(spec);
 
@@ -309,11 +423,13 @@ export class LlmClient {
       // Множник бюджету токенів: після обриву по ліміту повторюємо ту саму
       // модель, але вже з ширшим запасом.
       let retryBoost = 1;
+      // Скільки разів довелося стиснути контекст для цієї моделі.
+      let shrinkLevel = 0;
 
-      for (let attempt = 0; attempt < this.config.attemptsPerModel; attempt += 1) {
+      for (let attempt = 0; attempt < this.config.attemptsPerModel + shrinkLevel; attempt += 1) {
         if (this.deps.now() >= deadline) {
           attempts.push({ spec: label, kind: "timeout", detail: "вичерпано бюджет", ms: 0 });
-          return this.fail(attempts);
+          return this.finish(attempts, bestEffort);
         }
 
         const useJsonMode =
@@ -323,7 +439,7 @@ export class LlmClient {
         try {
           const result = await this.callOnce(
             spec,
-            options,
+            shrinkLevel > 0 ? shrinkOptions(options, shrinkLevel) : options,
             useJsonMode,
             this.budgetFor(spec, options.maxTokens ?? 1200, retryBoost),
             Boolean(options.json),
@@ -345,12 +461,39 @@ export class LlmClient {
 
           attempts.push({ spec: label, kind, status, detail, ms: this.deps.now() - started });
 
+          // Обрізану відповідь запам'ятовуємо як запасний варіант — раптом
+          // цілої не дасть ніхто. Довша обрізана краща за коротшу.
+          const partial = (error as { partialText?: string }).partialText;
+          if (partial && partial.length > (bestEffort?.text.length ?? 0)) {
+            bestEffort = { text: partial, spec };
+          }
+
           // Помилки, після яких повторювати цю модель безглуздо.
           if (kind === "auth") {
             this.disabledProviders.add(spec.provider);
             break;
           }
           if (kind === "model_missing") {
+            this.disabledModels.add(label);
+            break;
+          }
+          if (kind === "quota_exhausted") {
+            // Денна квота не відновиться за хвилину вистигання запобіжника.
+            // Знімаємо модель з обігу надовго, щоб не витрачати на неї спроби.
+            this.breakers.set(label, {
+              consecutiveFailures: this.config.breakerThreshold,
+              openUntil: this.deps.now() + this.config.quotaCooldownMs,
+            });
+            break;
+          }
+          if (kind === "context_overflow") {
+            // Винна не модель, а розмір нашого запиту. Стискаємо і пробуємо
+            // ту саму модель ще раз — перехід до наступної не допоміг би,
+            // бо завеликий контекст лишився б завеликим.
+            if (shrinkLevel < MAX_SHRINK_LEVEL) {
+              shrinkLevel += 1;
+              continue;
+            }
             this.disabledModels.add(label);
             break;
           }
@@ -366,7 +509,9 @@ export class LlmClient {
           }
           if (kind === "truncated") {
             // Повторювати з тим самим бюджетом безглуздо — обріже знову.
-            retryBoost *= 4;
+            // Але й нескінченно нарощувати не можна: за стелею моделі
+            // почнеться 400, тобто ми самі зламаємо робочу модель.
+            retryBoost = Math.min(retryBoost * 4, MAX_RETRY_BOOST);
           }
 
           this.noteFailure(spec);
@@ -381,7 +526,7 @@ export class LlmClient {
       }
     }
 
-    return this.fail(attempts);
+    return this.finish(attempts, bestEffort);
   }
 
   private kindFromThrown(error: unknown): FailureKind {
@@ -390,7 +535,14 @@ export class LlmClient {
     return "network";
   }
 
-  private fail(attempts: AttemptLog[]): never {
+  /** Або віддає найкраще з наявного, або визнає повний провал. */
+  private finish(
+    attempts: AttemptLog[],
+    bestEffort?: { text: string; spec: ModelSpec },
+  ): ChatResult {
+    if (bestEffort) {
+      return { text: bestEffort.text, spec: bestEffort.spec, attempts, truncated: true };
+    }
     throw new AllModelsFailedError(attempts);
   }
 }
@@ -399,20 +551,85 @@ export class LlmClient {
 export const llm = new LlmClient();
 
 /**
+ * Прибирає блоки роздумів reasoning-моделей.
+ *
+ * Критично для розбору JSON: у роздумах майже завжди є фігурні дужки
+ * («потрібно повернути {"needsLiveData": false}»), і наївний пошук від першої
+ * дужки до останньої захоплював обидва фрагменти разом, після чого падав
+ * увесь розбір — при цілком коректній відповіді поруч.
+ */
+export function stripReasoning(raw: string): string {
+  return raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, " ")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, " ")
+    .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, " ")
+    // Незакритий блок: модель почала думати й обірвалась по ліміту токенів.
+    .replace(/<think(?:ing)?>[\s\S]*$/i, " ");
+}
+
+/** Знаходить перший збалансований JSON-об'єкт, поважаючи рядки й екранування. */
+function firstBalancedObject(text: string): string | undefined {
+  const start = text.indexOf("{");
+  if (start === -1) return undefined;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * Витягує JSON з відповіді моделі.
  *
  * Толерантний свідомо: навіть із response_format частина моделей обгортає
- * результат у ```json-огорожу або додає рядок пояснення. Вимагати ідеалу
- * означало б без потреби відкидати придатні відповіді.
+ * результат у ```json-огорожу, додає рядок пояснення або блок роздумів.
+ * Вимагати ідеалу означало б без потреби відкидати придатні відповіді.
  */
 export function extractJson<T>(raw: string): T | undefined {
-  const withoutFence = raw.replace(/```(?:json)?/gi, "");
-  const start = withoutFence.indexOf("{");
-  const end = withoutFence.lastIndexOf("}");
+  const cleaned = stripReasoning(raw).replace(/```(?:json)?/gi, "");
+
+  // Спершу перший збалансований об'єкт — він переживає і сторонній текст
+  // після себе, і другий об'єкт поруч.
+  const balanced = firstBalancedObject(cleaned);
+  if (balanced) {
+    try {
+      return JSON.parse(balanced) as T;
+    } catch {
+      /* спробуємо ширший захват нижче */
+    }
+  }
+
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
   if (start === -1 || end <= start) return undefined;
 
   try {
-    return JSON.parse(withoutFence.slice(start, end + 1)) as T;
+    return JSON.parse(cleaned.slice(start, end + 1)) as T;
   } catch {
     return undefined;
   }
