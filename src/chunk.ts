@@ -89,9 +89,18 @@ function describeSchema(
     );
 
     for (const [name, rawValue] of Object.entries(properties)) {
-      const value = (
-        typeof rawValue?.$ref === "string" ? resolveRef(spec, rawValue.$ref) ?? rawValue : rawValue
-      ) as Json;
+      const ref: string | undefined =
+        typeof rawValue?.$ref === "string" ? rawValue.$ref : undefined;
+
+      // Цикл обриваємо явною позначкою, а не мовчазним упиранням у ліміт
+      // глибини: інакше рекурсивна схема дає кілька рівнів однакового шуму
+      // замість зрозумілого «далі те саме».
+      if (ref && seen.has(ref)) {
+        lines.push(`${pad}- ${name} (рекурсія → ${ref.split("/").pop()})`);
+        continue;
+      }
+
+      const value = (ref ? resolveRef(spec, ref) ?? rawValue : rawValue) as Json;
 
       const bits = [`${pad}- ${name}`];
       if (value.type) bits.push(`(${value.type})`);
@@ -107,7 +116,7 @@ function describeSchema(
           spec,
           value,
           depth + 1,
-          typeof rawValue?.$ref === "string" ? new Set([...seen, rawValue.$ref]) : seen,
+          ref ? new Set([...seen, ref]) : seen,
         );
         if (nested) lines.push(nested);
       }

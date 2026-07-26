@@ -3,28 +3,11 @@
  *
  * Прапорець --trace показує, як граф ходив по вузлах.
  */
-import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-
 import { ask } from "./agent.ts";
-import { resolveProvider } from "./llm.ts";
-
-/** Мінімальний .env-лоадер — щоб не тягти залежність заради п'яти рядків. */
-async function loadDotEnv(file = ".env") {
-  if (!existsSync(file)) return;
-
-  for (const line of (await readFile(file, "utf8")).split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-
-    const key = trimmed.slice(0, eq).trim();
-    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
-    if (key && process.env[key] === undefined) process.env[key] = value;
-  }
-}
+import { loadDotEnv } from "./env.ts";
+import { llm } from "./llm.ts";
+import { isFakeMode } from "./reason.ts";
+import { JSON_CHAIN, PROSE_CHAIN, specLabel } from "./providers.ts";
 
 async function main() {
   await loadDotEnv();
@@ -38,8 +21,21 @@ async function main() {
     process.exit(1);
   }
 
-  const provider = resolveProvider();
-  console.log(`провайдер: ${provider.name} / ${provider.model}\n`);
+  if (isFakeMode()) {
+    console.log("режим: офлайн (модель не викликається)\n");
+  } else if (!llm.hasAnyKey()) {
+    console.log(
+      "⚠️  нема жодного ключа (GROQ_API_KEY / OPENROUTER_API_KEY) — " +
+        "відповідь буде зібрана з документації без моделі\n",
+    );
+  } else {
+    const available = llm.availableModels(PROSE_CHAIN);
+    console.log(
+      `доступно моделей: ${available.length} із ${PROSE_CHAIN.length}` +
+        (available[0] ? `, перша в черзі — ${specLabel(available[0])}` : "") +
+        `\n(JSON-ланцюжок: ${llm.availableModels(JSON_CHAIN).length} із ${JSON_CHAIN.length})\n`,
+    );
+  }
 
   const result = await ask(question);
 

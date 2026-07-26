@@ -22,12 +22,18 @@
  * ("як брати гроші з картки" замість "invoice create"). Verify має право
  * переформулювати запит і сходити в пошук ще раз — але не більше двох
  * разів, інакше на поганому питанні граф крутився б вічно.
+ *
+ * Жоден вузол не має права впасти: допоміжні використовують значення за
+ * замовчуванням, а `generate` при повній відсутності моделей збирає
+ * відповідь із самої специфікації.
  */
 import { END, START, ReducedValue, StateGraph, StateSchema } from "@langchain/langgraph";
 import * as z from "zod";
 
-import { chat, chatJson } from "./llm.ts";
+import { degradedAnswer } from "./degraded.ts";
+import { checkGrounding } from "./grounding.ts";
 import { instrument, metrics } from "./metrics.ts";
+import { AllModelsFailedError, reason, reasonJson } from "./reason.ts";
 import { formatContext, search, type Hit } from "./retrieve.ts";
 import { getCurrencyRates } from "./tools.ts";
 
@@ -43,6 +49,8 @@ export const AgentState = new StateSchema({
   liveData: z.string().default(""),
   answer: z.string().default(""),
   verdict: z.string().default(""),
+  /** true — відповідь зібрана без моделі. */
+  degraded: z.boolean().default(false),
   attempts: new ReducedValue(z.number().default(0), {
     reducer: (current: number, update: number) => current + update,
   }),
@@ -53,6 +61,9 @@ export const AgentState = new StateSchema({
 
 type State = typeof AgentState.State;
 
+/** Останній результат пошуку — щоб `generate` міг деградувати до чанків. */
+let lastHits: Hit[] = [];
+
 const ANSWER_SYSTEM = `Ти — інженерний асистент по API monobank.
 
 Правила:
@@ -62,28 +73,35 @@ const ANSWER_SYSTEM = `Ти — інженерний асистент по API m
 - Якщо доречно — покажи короткий приклад запиту (curl або fetch).
 - Відповідай українською, стисло і по суті.`;
 
-/** Чи це питання про живі дані, чи про документацію. */
 async function route(state: State) {
-  const { needsLiveData } = await chatJson<{ needsLiveData: boolean }>(
+  const { value, via, degraded } = await reasonJson<{ needsLiveData: boolean }>(
     {
       system:
-        "Ти класифікатор. Відповідай лише JSON виду {\"needsLiveData\": true|false}. " +
+        'Ти класифікатор. Відповідай лише JSON виду {"needsLiveData": true|false}. ' +
         "true — якщо питання про ПОТОЧНИЙ курс валют. " +
         "false — якщо питання про те, як влаштоване API monobank, його ендпоїнти, поля, авторизацію.",
       user: state.question,
-      maxTokens: 50,
+      maxTokens: 60,
     },
     { needsLiveData: false },
   );
 
+  // Класифікатор недоступний — безпечніше піти в документацію: там
+  // відповідь хоча б релевантна, тоді як зайвий похід у курси валют
+  // видав би людині щось геть не по темі.
+  const needsLiveData = degraded ? false : value.needsLiveData === true;
+
   return {
     searchQuery: state.question,
-    trace: [`route: ${needsLiveData ? "потрібні живі дані" : "лише документація"}`],
     verdict: needsLiveData ? "live" : "docs",
+    trace: [
+      `route: ${needsLiveData ? "потрібні живі дані" : "лише документація"}` +
+        (degraded ? " (класифікатор недоступний, взято типове)" : ` [${via}]`),
+    ],
   };
 }
 
-async function fetchLive(state: State) {
+async function fetchLive(_state: State) {
   const liveData = await getCurrencyRates();
   return { liveData, trace: ["fetchLive: викликано /bank/currency"] };
 }
@@ -92,7 +110,8 @@ async function retrieve(state: State) {
   // На повторному заході беремо ширше — перший промах часто означає, що
   // потрібний чанк був на межі топу.
   const topK = state.attempts === 0 ? 5 : 8;
-  const hits: Hit[] = await search(state.searchQuery || state.question, topK);
+  const hits = await search(state.searchQuery || state.question, topK);
+  lastHits = hits;
 
   return {
     context: formatContext(hits),
@@ -107,43 +126,69 @@ async function retrieve(state: State) {
 }
 
 async function generate(state: State) {
-  const answer = await chat({
-    system: ANSWER_SYSTEM,
-    user: [
-      state.liveData ? `Живі дані з API:\n${state.liveData}\n` : "",
-      `Контекст зі специфікації:\n${state.context}`,
-      `\nПитання: ${state.question}`,
-    ]
-      .filter(Boolean)
-      .join("\n"),
-  });
+  const user = [
+    state.liveData ? `Живі дані з API:\n${state.liveData}\n` : "",
+    `Контекст зі специфікації:\n${state.context}`,
+    `\nПитання: ${state.question}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 
-  return { answer, trace: ["generate: відповідь складено"] };
+  try {
+    const { text, via } = await reason({ system: ANSWER_SYSTEM, user });
+    return { answer: text, degraded: false, trace: [`generate: відповідь складено [${via}]`] };
+  } catch (error) {
+    if (!(error instanceof AllModelsFailedError)) throw error;
+
+    return {
+      answer: degradedAnswer(state.question, lastHits, state.liveData || undefined),
+      degraded: true,
+      verdict: "ok",
+      trace: [
+        `generate: жодна модель не відповіла (${error.attempts.length} спроб) → ` +
+          "відповідь зібрано з документації",
+      ],
+    };
+  }
 }
 
 async function verify(state: State) {
-  const result = await chatJson<{ grounded: boolean; refinedQuery?: string }>(
-    {
-      system:
-        "Ти перевіряєш, чи відповідь повністю спирається на наданий контекст. " +
-        'Поверни лише JSON: {"grounded": true|false, "refinedQuery": "..."}. ' +
-        "grounded=false лише якщо у контексті бракує даних для відповіді. " +
-        "refinedQuery — переформульоване пошукове питання термінами OpenAPI (шлях, метод, назва поля).",
-      user: `Контекст:\n${state.context.slice(0, 6000)}\n\nВідповідь:\n${state.answer}`,
-      maxTokens: 200,
-    },
-    { grounded: true },
-  );
-
-  if (result.grounded) {
-    return { verdict: "ok", trace: ["verify: відповідь спирається на контекст"] };
+  // Деградовану відповідь перевіряти нічим і нема сенсу: вона за побудовою
+  // складається лише з фрагментів специфікації.
+  if (state.degraded) {
+    return { verdict: "ok", trace: ["verify: пропущено (відповідь без моделі)"] };
   }
+
+  const report = checkGrounding(state.answer, state.context, state.question);
+
+  if (report.grounded) {
+    return { verdict: "ok", trace: ["verify: усі згадані шляхи є в контексті"] };
+  }
+
+  const why = report.invented.length
+    ? `шляхів нема в контексті: ${report.invented.join(", ")}`
+    : "модель повідомила, що даних бракує";
 
   return {
     verdict: "insufficient",
-    searchQuery: result.refinedQuery?.trim() || state.searchQuery,
-    trace: [`verify: контексту бракує → новий запит "${result.refinedQuery ?? "той самий"}"`],
+    searchQuery: report.refinedQuery?.trim() || state.searchQuery,
+    trace: [`verify: ${why} → новий запит "${report.refinedQuery ?? "той самий"}"`],
   };
+}
+
+/**
+ * Куди йти після маршрутизації. Винесено з побудови графа, щоб рішення
+ * можна було перевірити без запуску всього пайплайну.
+ */
+export function routeDecision(state: Pick<State, "verdict">): "fetchLive" | "retrieve" {
+  return state.verdict === "live" ? "fetchLive" : "retrieve";
+}
+
+/** Чи має сенс ще один прохід пошуку. */
+export function verifyDecision(
+  state: Pick<State, "verdict" | "attempts">,
+): "retrieve" | typeof END {
+  return state.verdict === "insufficient" && state.attempts < MAX_ATTEMPTS ? "retrieve" : END;
 }
 
 export const graph = new StateGraph(AgentState)
@@ -153,15 +198,11 @@ export const graph = new StateGraph(AgentState)
   .addNode("generate", instrument("generate", generate))
   .addNode("verify", instrument("verify", verify))
   .addEdge(START, "route")
-  .addConditionalEdges("route", (state: State) =>
-    state.verdict === "live" ? "fetchLive" : "retrieve",
-  )
+  .addConditionalEdges("route", routeDecision)
   .addEdge("fetchLive", "retrieve")
   .addEdge("retrieve", "generate")
   .addEdge("generate", "verify")
-  .addConditionalEdges("verify", (state: State) =>
-    state.verdict === "insufficient" && state.attempts < MAX_ATTEMPTS ? "retrieve" : END,
-  )
+  .addConditionalEdges("verify", verifyDecision)
   .compile();
 
 export interface AskResult {
@@ -169,12 +210,14 @@ export interface AskResult {
   sources: string[];
   trace: string[];
   attempts: number;
-  /** Час, виклики моделі й токени по вузлах графа. */
+  degraded: boolean;
   metrics: string;
 }
 
 export async function ask(question: string): Promise<AskResult> {
   metrics.reset();
+  lastHits = [];
+
   const final = (await graph.invoke({ question })) as State;
 
   return {
@@ -182,6 +225,7 @@ export async function ask(question: string): Promise<AskResult> {
     sources: final.sources,
     trace: final.trace,
     attempts: final.attempts,
+    degraded: final.degraded,
     metrics: metrics.report(),
   };
 }

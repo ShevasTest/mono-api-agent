@@ -62,9 +62,4 @@ export async function embedQuery(text: string): Promise<number[]> {
   return vector;
 }
 
-/** Вектори вже нормалізовані, тож косинусна близькість — це скалярний добуток. */
-export function cosineSimilarity(a: readonly number[], b: readonly number[]): number {
-  let sum = 0;
-  for (let i = 0; i < a.length; i += 1) sum += (a[i] ?? 0) * (b[i] ?? 0);
-  return sum;
-}
+export { cosineSimilarity } from "./scoring.ts";

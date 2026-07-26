@@ -11,12 +11,13 @@
     "ingest": "tsx src/ingest.ts",
     "ask": "tsx src/cli.ts",
     "search": "tsx src/search-cli.ts",
-    "typecheck": "tsc --noEmit"
+    "bench": "tsx src/bench.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@langchain/langgraph": "^1.4.8",
-    "openai": "^6.49.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
