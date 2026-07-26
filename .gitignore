@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.local
+
+# Індекс і кеш специфікацій — відтворюються командою `npm run ingest`
+data/
+
+.DS_Store
+*.log

@@ -1,0 +1,27 @@
+{
+  "name": "mono-api-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "RAG-агент по офіційних OpenAPI-специфікаціях monobank: локальні ембединги + LangGraph з self-check та live-інструментом",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "ingest": "tsx src/ingest.ts",
+    "ask": "tsx src/cli.ts",
+    "search": "tsx src/search-cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@langchain/langgraph": "^1.4.8",
+    "openai": "^6.49.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
