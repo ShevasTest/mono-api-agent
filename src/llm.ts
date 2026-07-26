@@ -30,6 +30,9 @@ import {
   PROVIDERS,
   REASONING_TOKEN_FLOOR,
   specLabel,
+  resolveKeys,
+  keyId,
+  type ApiKey,
   type ModelSpec,
   type ProviderName,
 } from "./providers.ts";
@@ -185,11 +188,26 @@ interface BreakerState {
   openUntil: number;
 }
 
-/** Витягує число секунд із Retry-After (підтримується лише формат «секунди»). */
-function parseRetryAfter(header: string | null): number | undefined {
+/**
+ * Витягує паузу з Retry-After.
+ *
+ * RFC 9110 дозволяє два формати: число секунд і HTTP-дату. Перша версія
+ * розуміла лише перший, і на даті мовчки повертала undefined — тобто ми
+ * ігнорували пряму вказівку сервера, коли він її давав.
+ */
+export function parseRetryAfter(header: string | null, now: number): number | undefined {
   if (!header) return undefined;
-  const seconds = Number(header.trim());
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+
+  const trimmed = header.trim();
+  if (!trimmed) return undefined;
+
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : undefined;
+
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return undefined;
+
+  return Math.max(0, at - now);
 }
 
 export function classifyStatus(status: number): FailureKind {
@@ -205,10 +223,18 @@ export class LlmClient {
   private readonly deps: LlmDeps;
 
   private readonly breakers = new Map<string, BreakerState>();
-  private readonly disabledProviders = new Set<ProviderName>();
   private readonly disabledModels = new Set<string>();
   /** Моделі, яким довелося вимкнути JSON-режим через 400. */
   private readonly jsonModeDenied = new Set<string>();
+
+  /**
+   * Стан окремих ключів, а не провайдерів цілком.
+   *
+   * Раніше 401 вимикав провайдера повністю — з одним ключем це те саме, але
+   * з кількома означало б викинути справні ключі через один зіпсований.
+   */
+  private readonly deadKeys = new Set<string>();
+  private readonly keyCooldowns = new Map<string, number>();
 
   constructor(deps: Partial<LlmDeps> = {}, config: Partial<LlmConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -224,22 +250,39 @@ export class LlmClient {
   /** Скидає накопичений стан — потрібно тестам і довгоживучим процесам. */
   reset() {
     this.breakers.clear();
-    this.disabledProviders.clear();
     this.disabledModels.clear();
     this.jsonModeDenied.clear();
+    this.deadKeys.clear();
+    this.keyCooldowns.clear();
   }
 
-  /** Чи є хоч один ключ, тобто чи взагалі можна кудись піти. */
+  /** Усі налаштовані ключі провайдера, придатні до використання зараз. */
+  availableKeys(provider: ProviderName): ApiKey[] {
+    const now = this.deps.now();
+    return resolveKeys(provider, this.deps.env).filter((key) => {
+      const id = keyId(key);
+      if (this.deadKeys.has(id)) return false;
+      return (this.keyCooldowns.get(id) ?? 0) <= now;
+    });
+  }
+
+  /** Скільки ключів налаштовано взагалі, незалежно від їхнього стану. */
+  configuredKeyCount(): number {
+    return (Object.keys(PROVIDERS) as ProviderName[]).reduce(
+      (sum, provider) => sum + resolveKeys(provider, this.deps.env).length,
+      0,
+    );
+  }
+
   hasAnyKey(): boolean {
-    return Object.values(PROVIDERS).some((p) => Boolean(this.deps.env[p.envKey]));
+    return this.configuredKeyCount() > 0;
   }
 
   availableModels(chain: readonly ModelSpec[]): ModelSpec[] {
     const now = this.deps.now();
     return chain.filter((spec) => {
-      if (this.disabledProviders.has(spec.provider)) return false;
       if (this.disabledModels.has(specLabel(spec))) return false;
-      if (!this.deps.env[PROVIDERS[spec.provider].envKey]) return false;
+      if (this.availableKeys(spec.provider).length === 0) return false;
 
       const breaker = this.breakers.get(specLabel(spec));
       return !breaker || breaker.openUntil <= now;
@@ -285,21 +328,18 @@ export class LlmClient {
 
   private async callOnce(
     spec: ModelSpec,
+    apiKey: ApiKey,
     options: ChatOptions,
     useJsonMode: boolean,
     maxTokens: number,
     expectJson: boolean,
   ): Promise<{ text: string; promptTokens: number; completionTokens: number }> {
     const provider = PROVIDERS[spec.provider];
-    const apiKey = this.deps.env[provider.envKey];
-    if (!apiKey) {
-      throw Object.assign(new Error("нема ключа"), { kind: "auth" as FailureKind });
-    }
 
     const response = await this.deps.fetch(provider.baseUrl, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${apiKey}`,
+        authorization: `Bearer ${apiKey.value}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
@@ -331,7 +371,10 @@ export class LlmClient {
       throw Object.assign(new Error(`HTTP ${response.status} ${body.slice(0, 160)}`), {
         kind,
         status: response.status,
-        retryAfterMs: parseRetryAfter(response.headers?.get?.("retry-after") ?? null),
+        retryAfterMs: parseRetryAfter(
+          response.headers?.get?.("retry-after") ?? null,
+          this.deps.now(),
+        ),
       });
     }
 
@@ -415,113 +458,121 @@ export class LlmClient {
 
     for (const spec of this.availableModels(chain)) {
       const label = specLabel(spec);
+      if (this.disabledModels.has(label)) continue;
 
-      // Список доступних моделей знято на початку, але під час проходу
-      // ланцюжка стан міг змінитись: 401 від першої моделі провайдера
-      // вимикає провайдера цілком, і решту його моделей чіпати вже не можна.
-      if (this.disabledProviders.has(spec.provider) || this.disabledModels.has(label)) continue;
-      // Множник бюджету токенів: після обриву по ліміту повторюємо ту саму
-      // модель, але вже з ширшим запасом.
-      let retryBoost = 1;
-      // Скільки разів довелося стиснути контекст для цієї моделі.
-      let shrinkLevel = 0;
+      // Ключі перебираються всередині моделі, а не зовні. Причина: денна
+      // квота OpenRouter вичерпується на ключ і одразу на всі безкоштовні
+      // моделі. Якби ключ мінявся лише на наступній моделі, ми б спалили
+      // решту ланцюжка на тому самому вичерпаному ключі.
+      let handled = false;
 
-      for (let attempt = 0; attempt < this.config.attemptsPerModel + shrinkLevel; attempt += 1) {
-        if (this.deps.now() >= deadline) {
-          attempts.push({ spec: label, kind: "timeout", detail: "вичерпано бюджет", ms: 0 });
-          return this.finish(attempts, bestEffort);
-        }
+      for (const apiKey of this.availableKeys(spec.provider)) {
+        if (handled || this.disabledModels.has(label)) break;
 
-        const useJsonMode =
-          Boolean(options.json) && spec.supportsJsonMode && !this.jsonModeDenied.has(label);
+        const id = keyId(apiKey);
+        // Множник бюджету токенів: після обриву повторюємо ту саму модель,
+        // але вже з ширшим запасом.
+        let retryBoost = 1;
+        // Скільки разів довелося стиснути контекст.
+        let shrinkLevel = 0;
 
-        const started = this.deps.now();
-        try {
-          const result = await this.callOnce(
-            spec,
-            shrinkLevel > 0 ? shrinkOptions(options, shrinkLevel) : options,
-            useJsonMode,
-            this.budgetFor(spec, options.maxTokens ?? 1200, retryBoost),
-            Boolean(options.json),
-          );
-
-          metrics.recordCall({
-            model: label,
-            promptTokens: result.promptTokens,
-            completionTokens: result.completionTokens,
-            durationMs: this.deps.now() - started,
-          });
-
-          this.noteSuccess(spec);
-          return { text: result.text, spec, attempts };
-        } catch (error) {
-          const kind = (error as { kind?: FailureKind }).kind ?? this.kindFromThrown(error);
-          const status = (error as { status?: number }).status;
-          const detail = error instanceof Error ? error.message : String(error);
-
-          attempts.push({ spec: label, kind, status, detail, ms: this.deps.now() - started });
-
-          // Обрізану відповідь запам'ятовуємо як запасний варіант — раптом
-          // цілої не дасть ніхто. Довша обрізана краща за коротшу.
-          const partial = (error as { partialText?: string }).partialText;
-          if (partial && partial.length > (bestEffort?.text.length ?? 0)) {
-            bestEffort = { text: partial, spec };
+        for (let attempt = 0; attempt < this.config.attemptsPerModel + shrinkLevel; attempt += 1) {
+          if (this.deps.now() >= deadline) {
+            attempts.push({ spec: label, kind: "timeout", detail: "вичерпано бюджет", ms: 0 });
+            return this.finish(attempts, bestEffort);
           }
 
-          // Помилки, після яких повторювати цю модель безглуздо.
-          if (kind === "auth") {
-            this.disabledProviders.add(spec.provider);
-            break;
-          }
-          if (kind === "model_missing") {
-            this.disabledModels.add(label);
-            break;
-          }
-          if (kind === "quota_exhausted") {
-            // Денна квота не відновиться за хвилину вистигання запобіжника.
-            // Знімаємо модель з обігу надовго, щоб не витрачати на неї спроби.
-            this.breakers.set(label, {
-              consecutiveFailures: this.config.breakerThreshold,
-              openUntil: this.deps.now() + this.config.quotaCooldownMs,
+          const useJsonMode =
+            Boolean(options.json) && spec.supportsJsonMode && !this.jsonModeDenied.has(label);
+
+          const started = this.deps.now();
+          try {
+            const result = await this.callOnce(
+              spec,
+              apiKey,
+              shrinkLevel > 0 ? shrinkOptions(options, shrinkLevel) : options,
+              useJsonMode,
+              this.budgetFor(spec, options.maxTokens ?? 1200, retryBoost),
+              Boolean(options.json),
+            );
+
+            metrics.recordCall({
+              model: label,
+              promptTokens: result.promptTokens,
+              completionTokens: result.completionTokens,
+              durationMs: this.deps.now() - started,
             });
-            break;
-          }
-          if (kind === "context_overflow") {
-            // Винна не модель, а розмір нашого запиту. Стискаємо і пробуємо
-            // ту саму модель ще раз — перехід до наступної не допоміг би,
-            // бо завеликий контекст лишився б завеликим.
-            if (shrinkLevel < MAX_SHRINK_LEVEL) {
-              shrinkLevel += 1;
-              continue;
+
+            this.noteSuccess(spec);
+            return { text: result.text, spec, attempts };
+          } catch (error) {
+            const kind = (error as { kind?: FailureKind }).kind ?? this.kindFromThrown(error);
+            const status = (error as { status?: number }).status;
+            const detail = error instanceof Error ? error.message : String(error);
+
+            attempts.push({
+              spec: `${label} [${apiKey.source}]`,
+              kind,
+              status,
+              detail,
+              ms: this.deps.now() - started,
+            });
+
+            // Обрізану відповідь запам'ятовуємо як запасний варіант — раптом
+            // цілої не дасть ніхто. Довша обрізана краща за коротшу.
+            const partial = (error as { partialText?: string }).partialText;
+            if (partial && partial.length > (bestEffort?.text.length ?? 0)) {
+              bestEffort = { text: partial, spec };
             }
-            this.disabledModels.add(label);
-            break;
-          }
-          if (kind === "bad_request") {
-            // Найчастіша причина — модель не вміє response_format.
-            // Знімаємо JSON-режим і даємо їй ще один шанс.
-            if (useJsonMode && !this.jsonModeDenied.has(label)) {
-              this.jsonModeDenied.add(label);
-              continue;
+
+            if (kind === "auth") {
+              // Зіпсований ключ, а не зіпсований провайдер: решта ключів
+              // цього провайдера має право спробувати.
+              this.deadKeys.add(id);
+              break;
             }
-            this.disabledModels.add(label);
-            break;
+            if (kind === "quota_exhausted") {
+              // Квота прив'язана до облікового запису, тож вона вбиває всі
+              // моделі цього ключа, а не одну. Гасимо ключ цілком і йдемо
+              // на наступний — саме заради цього і потрібен другий ключ.
+              this.keyCooldowns.set(id, this.deps.now() + this.config.quotaCooldownMs);
+              break;
+            }
+            if (kind === "model_missing") {
+              this.disabledModels.add(label);
+              handled = true;
+              break;
+            }
+            if (kind === "context_overflow") {
+              if (shrinkLevel < MAX_SHRINK_LEVEL) {
+                shrinkLevel += 1;
+                continue;
+              }
+              this.disabledModels.add(label);
+              handled = true;
+              break;
+            }
+            if (kind === "bad_request") {
+              if (useJsonMode && !this.jsonModeDenied.has(label)) {
+                this.jsonModeDenied.add(label);
+                continue;
+              }
+              this.disabledModels.add(label);
+              handled = true;
+              break;
+            }
+            if (kind === "truncated") {
+              retryBoost = Math.min(retryBoost * 4, MAX_RETRY_BOOST);
+            }
+
+            this.noteFailure(spec);
+
+            if (attempt === this.config.attemptsPerModel + shrinkLevel - 1) break;
+
+            await this.deps.sleep(
+              this.backoffFor(attempt, (error as { retryAfterMs?: number }).retryAfterMs),
+            );
           }
-          if (kind === "truncated") {
-            // Повторювати з тим самим бюджетом безглуздо — обріже знову.
-            // Але й нескінченно нарощувати не можна: за стелею моделі
-            // почнеться 400, тобто ми самі зламаємо робочу модель.
-            retryBoost = Math.min(retryBoost * 4, MAX_RETRY_BOOST);
-          }
-
-          this.noteFailure(spec);
-
-          const isLastAttempt = attempt === this.config.attemptsPerModel - 1;
-          if (isLastAttempt) break;
-
-          await this.deps.sleep(
-            this.backoffFor(attempt, (error as { retryAfterMs?: number }).retryAfterMs),
-          );
         }
       }
     }

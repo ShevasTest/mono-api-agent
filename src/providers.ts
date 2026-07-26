@@ -120,3 +120,41 @@ export const PROSE_CHAIN: ModelSpec[] = [
 export function specLabel(spec: ModelSpec): string {
   return `${spec.provider}/${spec.model}`;
 }
+
+export interface ApiKey {
+  provider: ProviderName;
+  value: string;
+  /** Ім'я змінної оточення — для повідомлень; сам ключ нікуди не друкуємо. */
+  source: string;
+}
+
+/**
+ * Збирає всі ключі провайдера: `X_API_KEY`, `X_API_KEY_2`, `X_API_KEY_3`…
+ *
+ * Кілька ключів — це захист не від падіння провайдера (тут вони не
+ * допоможуть), а від лімітів, прив'язаних до облікового запису: денна квота
+ * безкоштовних моделей OpenRouter вичерпується на ключ, і другий ключ дає
+ * ще один такий самий добовий бюджет.
+ */
+export function resolveKeys(provider: ProviderName, env: NodeJS.ProcessEnv): ApiKey[] {
+  const base = PROVIDERS[provider].envKey;
+  const keys: ApiKey[] = [];
+  const seen = new Set<string>();
+
+  const add = (source: string) => {
+    const value = env[source]?.trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    keys.push({ provider, value, source });
+  };
+
+  add(base);
+  for (let i = 2; i <= 10; i += 1) add(`${base}_${i}`);
+
+  return keys;
+}
+
+/** Безпечний ідентифікатор ключа для логів і станів — без самого секрету. */
+export function keyId(key: ApiKey): string {
+  return `${key.provider}:${key.source}`;
+}

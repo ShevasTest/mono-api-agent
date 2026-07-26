@@ -1,22 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { degradedAnswer } from "../src/degraded.ts";
-import type { Hit } from "../src/retrieve.ts";
+import { degradedAnswer, type SourceExcerpt } from "../src/degraded.ts";
 
-function hit(title: string, text: string): Hit {
-  return {
-    score: 0.9,
-    chunk: {
-      id: title,
-      spec: "acquiring",
-      kind: "endpoint",
-      title,
-      text,
-      embedText: title,
-      vector: [],
-    },
-  };
+function hit(title: string, text: string): SourceExcerpt {
+  return { title, text };
 }
 
 const INVOICE = hit(

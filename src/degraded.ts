@@ -7,7 +7,11 @@
  * Тоді ми чесно кажемо, що модель недоступна, і віддаємо сам матеріал —
  * це гірше за згенеровану відповідь, але незрівнянно краще за помилку.
  */
-import type { Hit } from "./retrieve.ts";
+/** Мінімум, потрібний для відповіді без моделі. */
+export interface SourceExcerpt {
+  title: string;
+  text: string;
+}
 
 /** Дістає з чанка рядки, які найкорисніші людині без переказу моделі. */
 function outline(text: string, maxLines: number): string[] {
@@ -18,7 +22,11 @@ function outline(text: string, maxLines: number): string[] {
   return meaningful.slice(0, maxLines);
 }
 
-export function degradedAnswer(question: string, hits: readonly Hit[], liveData?: string): string {
+export function degradedAnswer(
+  question: string,
+  hits: readonly SourceExcerpt[],
+  liveData?: string,
+): string {
   if (hits.length === 0 && !liveData) {
     return (
       "Жодна мовна модель зараз недоступна, і в специфікації не знайшлося " +
@@ -35,7 +43,7 @@ export function degradedAnswer(question: string, hits: readonly Hit[], liveData?
   if (liveData) parts.push("", liveData);
 
   for (const [i, hit] of hits.slice(0, 3).entries()) {
-    parts.push("", `${i + 1}. ${hit.chunk.title}`, ...outline(hit.chunk.text, 14).map((l) => `   ${l}`));
+    parts.push("", `${i + 1}. ${hit.title}`, ...outline(hit.text, 14).map((l) => `   ${l}`));
   }
 
   return parts.join("\n");

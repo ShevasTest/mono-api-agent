@@ -11,6 +11,7 @@ import {
   LlmClient,
   MAX_RETRY_BOOST,
   extractJson,
+  parseRetryAfter,
   shrinkOptions,
   stripReasoning,
   type LlmDeps,
@@ -369,5 +370,38 @@ describe("стеля нарощування бюджету токенів", () =
     await h.client.chat({ ...PROMPT, maxTokens: 100 });
 
     assert.equal(h.requests[0]?.maxTokens, 100);
+  });
+});
+
+describe("Retry-After", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("розуміє число секунд", () => {
+    assert.equal(parseRetryAfter("5", NOW), 5000);
+  });
+
+  it("розуміє HTTP-дату", () => {
+    const future = new Date(NOW + 30_000).toUTCString();
+    const parsed = parseRetryAfter(future, NOW);
+    assert.ok(parsed !== undefined && Math.abs(parsed - 30_000) < 1000);
+  });
+
+  it("дата в минулому дає нуль, а не від'ємну паузу", () => {
+    const past = new Date(NOW - 60_000).toUTCString();
+    assert.equal(parseRetryAfter(past, NOW), 0);
+  });
+
+  it("від'ємні секунди ігноруються", () => {
+    assert.equal(parseRetryAfter("-5", NOW), undefined);
+  });
+
+  it("сміття ігнорується", () => {
+    assert.equal(parseRetryAfter("скоро", NOW), undefined);
+    assert.equal(parseRetryAfter("", NOW), undefined);
+    assert.equal(parseRetryAfter(null, NOW), undefined);
+  });
+
+  it("нуль секунд означає негайний повтор", () => {
+    assert.equal(parseRetryAfter("0", NOW), 0);
   });
 });

@@ -24,7 +24,23 @@ export async function loadIndex(): Promise<SearchIndex> {
     throw new Error("індексу нема — спочатку запусти `npm run ingest`");
   }
 
-  cached = JSON.parse(await readFile(INDEX_PATH, "utf8")) as SearchIndex;
+  let parsed: SearchIndex;
+  try {
+    parsed = JSON.parse(await readFile(INDEX_PATH, "utf8")) as SearchIndex;
+  } catch (error) {
+    // Обірваний `npm run ingest` лишає биті пів-файлу. Стек JSON.parse тут
+    // нічого не пояснює людині, тому кажемо прямо, що робити.
+    throw new Error(
+      `індекс пошкоджено (${error instanceof Error ? error.message : error}). ` +
+        "Перезбери його: npm run ingest -- --refresh",
+    );
+  }
+
+  if (!Array.isArray(parsed.chunks) || parsed.chunks.length === 0) {
+    throw new Error("індекс порожній — перезбери: npm run ingest -- --refresh");
+  }
+
+  cached = parsed;
   return cached;
 }
 

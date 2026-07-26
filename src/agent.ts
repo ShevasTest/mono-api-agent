@@ -30,11 +30,11 @@
 import { END, START, ReducedValue, StateGraph, StateSchema } from "@langchain/langgraph";
 import * as z from "zod";
 
-import { degradedAnswer } from "./degraded.ts";
+import { degradedAnswer, type SourceExcerpt } from "./degraded.ts";
 import { checkGrounding } from "./grounding.ts";
 import { instrument, metrics } from "./metrics.ts";
 import { AllModelsFailedError, reason, reasonJson } from "./reason.ts";
-import { formatContext, search, type Hit } from "./retrieve.ts";
+import { formatContext, search } from "./retrieve.ts";
 import { getCurrencyRates } from "./tools.ts";
 
 const MAX_ATTEMPTS = 2;
@@ -53,6 +53,15 @@ export const AgentState = new StateSchema({
   degraded: z.boolean().default(false),
   /** true — жодна модель не дописала відповідь до кінця. */
   truncated: z.boolean().default(false),
+  /**
+   * Витяги зі знайдених джерел живуть у стані графа, а не в змінній модуля.
+   * Спершу вони лежали поруч із графом — і два одночасні виклики `ask()`
+   * затирали б знахідки одне одного.
+   */
+  excerpts: new ReducedValue(
+    z.array(z.object({ title: z.string(), text: z.string() })).default(() => []),
+    { reducer: (_current: SourceExcerpt[], update: SourceExcerpt[]) => update },
+  ),
   attempts: new ReducedValue(z.number().default(0), {
     reducer: (current: number, update: number) => current + update,
   }),
@@ -62,9 +71,6 @@ export const AgentState = new StateSchema({
 });
 
 type State = typeof AgentState.State;
-
-/** Останній результат пошуку — щоб `generate` міг деградувати до чанків. */
-let lastHits: Hit[] = [];
 
 const ANSWER_SYSTEM = `Ти — інженерний асистент по API monobank.
 
@@ -115,11 +121,11 @@ async function retrieve(state: State) {
   // потрібний чанк був на межі топу.
   const topK = state.attempts === 0 ? 5 : 8;
   const hits = await search(state.searchQuery || state.question, topK);
-  lastHits = hits;
 
   return {
     context: formatContext(hits),
     sources: hits.map((hit) => hit.chunk.title),
+    excerpts: hits.map((hit) => ({ title: hit.chunk.title, text: hit.chunk.text })),
     attempts: 1,
     trace: [
       `retrieve (спроба ${state.attempts + 1}, k=${topK}): ${hits
@@ -155,7 +161,7 @@ async function generate(state: State) {
     if (!(error instanceof AllModelsFailedError)) throw error;
 
     return {
-      answer: degradedAnswer(state.question, lastHits, state.liveData || undefined),
+      answer: degradedAnswer(state.question, state.excerpts, state.liveData || undefined),
       degraded: true,
       verdict: "ok",
       trace: [
@@ -237,7 +243,6 @@ export interface AskResult {
 
 export async function ask(question: string): Promise<AskResult> {
   metrics.reset();
-  lastHits = [];
 
   const final = (await graph.invoke({ question })) as State;
 
