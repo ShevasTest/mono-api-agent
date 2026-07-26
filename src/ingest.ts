@@ -9,7 +9,7 @@ import path from "node:path";
 import { chunkSpec, type Chunk } from "./chunk.ts";
 import { EMBEDDING_DIM, EMBEDDING_MODEL, embedPassages } from "./embed.ts";
 import { INDEX_PATH, type SearchIndex } from "./index-store.ts";
-import { loadAllSpecs } from "./specs.ts";
+import { loadAllSpecs, specHash } from "./specs.ts";
 
 async function main() {
   const refresh = process.argv.includes("--refresh");
@@ -18,7 +18,9 @@ async function main() {
   const specs = await loadAllSpecs(refresh);
 
   const chunks: Chunk[] = [];
+  const specHashes: Record<string, string> = {};
   for (const { source, spec } of specs) {
+    specHashes[source.name] = specHash(spec);
     const produced = chunkSpec(source.name, spec);
     console.log(
       `  ${source.name}: ${Object.keys(spec.paths ?? {}).length} шляхів → ${produced.length} чанків`,
@@ -39,6 +41,7 @@ async function main() {
     model: EMBEDDING_MODEL,
     dim: EMBEDDING_DIM,
     builtAt: new Date().toISOString(),
+    specHashes,
     chunks: chunks.map((chunk, i) => ({ ...chunk, vector: vectors[i] ?? [] })),
   };
 

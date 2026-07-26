@@ -13,7 +13,8 @@
     "search": "tsx src/search-cli.ts",
     "bench": "tsx src/bench.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "doctor": "tsx src/doctor.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

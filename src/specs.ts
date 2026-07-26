@@ -5,6 +5,7 @@
  * специфікація вшита в глобальну змінну `__redoc_state`. Дістаємо її звідти
  * і кешуємо на диск, щоб ingest не ходив у мережу щоразу.
  */
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -105,6 +106,12 @@ export async function loadSpec(source: SpecSource, refresh = false): Promise<Ope
   await writeFile(cachePath, JSON.stringify(spec, null, 1), "utf8");
 
   return spec;
+}
+
+/** Відбиток специфікації — щоб помітити, що документація змінилась. */
+export function specHash(spec: OpenApiSpec): string {
+  const stable = JSON.stringify({ paths: spec.paths, components: spec.components });
+  return createHash("sha256").update(stable).digest("hex").slice(0, 16);
 }
 
 export async function loadAllSpecs(refresh = false) {

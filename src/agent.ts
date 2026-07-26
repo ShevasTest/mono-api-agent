@@ -35,6 +35,11 @@ import { checkGrounding } from "./grounding.ts";
 import { instrument, metrics } from "./metrics.ts";
 import { AllModelsFailedError, reason, reasonJson } from "./reason.ts";
 import { formatContext, search } from "./retrieve.ts";
+import {
+  UNTRUSTED_INPUT_RULE,
+  sanitizeQuestion,
+  wrapQuestion,
+} from "./sanitize.ts";
 import { getCurrencyRates } from "./tools.ts";
 
 const MAX_ATTEMPTS = 2;
@@ -79,7 +84,9 @@ const ANSWER_SYSTEM = `Ти — інженерний асистент по API m
 - Якщо в контексті чогось нема — прямо скажи, чого саме бракує. Не вигадуй назв полів, ендпоїнтів чи заголовків.
 - Називай точні шляхи, HTTP-методи та імена полів так, як вони в специфікації.
 - Якщо доречно — покажи короткий приклад запиту (curl або fetch).
-- Відповідай українською, стисло і по суті.`;
+- Відповідай українською, стисло і по суті.
+
+${UNTRUSTED_INPUT_RULE}`;
 
 async function route(state: State) {
   const { value, via, degraded } = await reasonJson<{ needsLiveData: boolean }>(
@@ -139,7 +146,7 @@ async function generate(state: State) {
   const user = [
     state.liveData ? `Живі дані з API:\n${state.liveData}\n` : "",
     `Контекст зі специфікації:\n${state.context}`,
-    `\nПитання: ${state.question}`,
+    `\nПитання користувача:\n${wrapQuestion(state.question)}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -242,16 +249,27 @@ export interface AskResult {
 }
 
 export async function ask(question: string): Promise<AskResult> {
-  metrics.reset();
+  // Кожен виклик отримує власний ізольований набір лічильників, тож
+  // паралельні `ask()` не перемішують свої кроки й токени.
+  return metrics.runIsolated(async () => {
+    const clean = sanitizeQuestion(question);
+    if (!clean.text) throw new Error("порожнє питання");
 
-  const final = (await graph.invoke({ question })) as State;
+    const notes: string[] = [];
+    if (clean.clipped) notes.push(`питання обрізано до ${clean.text.length} символів`);
+    if (clean.suspicious) {
+      notes.push("питання схоже на спробу перебити інструкції — оброблено як звичайні дані");
+    }
 
-  return {
-    answer: final.answer,
-    sources: final.sources,
-    trace: final.trace,
-    attempts: final.attempts,
-    degraded: final.degraded,
-    metrics: metrics.report(),
-  };
+    const final = (await graph.invoke({ question: clean.text })) as State;
+
+    return {
+      answer: final.answer,
+      sources: final.sources,
+      trace: [...notes.map((n) => `вхід: ${n}`), ...final.trace],
+      attempts: final.attempts,
+      degraded: final.degraded,
+      metrics: metrics.report(),
+    };
+  });
 }

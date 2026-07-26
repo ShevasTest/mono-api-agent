@@ -1,17 +1,24 @@
 /**
- * Спостережуваність: скільки коштував і скільки тривав кожен прохід графа.
+ * Спостережуваність: скільки коштував і скільки тривав кожен крок графа.
  *
- * Без цього неможливо приймати рішення про cost/quality. Саме ці заміри
- * показали, що LLM-суддя у вузлі verify з'їдав чверть часу проходу — після
- * чого його замінили на детерміновану перевірку.
+ * Саме ці заміри показали, що LLM-суддя у вузлі verify з'їдав чверть часу
+ * проходу — після чого його замінили на детерміновану перевірку.
  *
- * Важлива деталь: вузли рахуються ПО КРОКАХ, а не по іменах. Граф має цикл,
- * тож `retrieve` і `generate` трапляються в одному проході двічі. Перша
- * версія групувала по імені й показувала токени другого проходу в рядку
- * першого — тобто подвоювала їх.
+ * Два рішення, які тут неочевидні:
+ *
+ * 1. Кроки рахуються ПО ПОРЯДКУ, а не по іменах вузлів. Граф має цикл, тож
+ *    `retrieve` і `generate` трапляються в одному проході двічі. Перша версія
+ *    групувала по імені й показувала токени другого проходу в рядку першого.
+ *
+ * 2. Лічильники живуть у AsyncLocalStorage, а не в одному об'єкті на процес.
+ *    Глобальний лічильник влаштовував доти, доки запит був один; два
+ *    паралельні `ask()` перемішали б свої кроки й токени в спільну купу.
+ *    ALS дає кожному проходу власний ізольований набір, не протягуючи
+ *    лічильник параметром через усі вузли графа.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
+
 export interface LlmCall {
-  /** Номер кроку графа, до якого належить виклик. */
   step: number;
   model: string;
   promptTokens: number;
@@ -25,11 +32,11 @@ export interface StepTiming {
   durationMs: number;
 }
 
-class Metrics {
-  private calls: LlmCall[] = [];
-  private steps: StepTiming[] = [];
-  private currentStep = -1;
-  private stepCounter = 0;
+class Collector {
+  calls: LlmCall[] = [];
+  steps: StepTiming[] = [];
+  currentStep = -1;
+  stepCounter = 0;
 
   reset() {
     this.calls = [];
@@ -37,51 +44,80 @@ class Metrics {
     this.currentStep = -1;
     this.stepCounter = 0;
   }
+}
 
-  /** Вузли графа виконуються послідовно, тож достатньо лічильника кроків. */
+const storage = new AsyncLocalStorage<Collector>();
+
+/**
+ * Збірник за замовчуванням — для коду поза `runIsolated`: разових скриптів,
+ * тестів окремих функцій, ручних викликів.
+ */
+const ambient = new Collector();
+
+function current(): Collector {
+  return storage.getStore() ?? ambient;
+}
+
+class Metrics {
+  /** Виконує прохід із власним ізольованим набором лічильників. */
+  runIsolated<T>(fn: () => Promise<T>): Promise<T> {
+    return storage.run(new Collector(), fn);
+  }
+
+  reset() {
+    current().reset();
+  }
+
   beginStep(): number {
-    this.currentStep = this.stepCounter;
-    this.stepCounter += 1;
-    return this.currentStep;
+    const collector = current();
+    collector.currentStep = collector.stepCounter;
+    collector.stepCounter += 1;
+    return collector.currentStep;
   }
 
   recordStep(step: number, node: string, durationMs: number) {
-    this.steps.push({ step, node, durationMs });
+    current().steps.push({ step, node, durationMs });
   }
 
   recordCall(call: Omit<LlmCall, "step"> & { step?: number }) {
-    this.calls.push({ ...call, step: call.step ?? this.currentStep });
+    const collector = current();
+    collector.calls.push({ ...call, step: call.step ?? collector.currentStep });
   }
 
   get totalTokens(): number {
-    return this.calls.reduce((sum, c) => sum + c.promptTokens + c.completionTokens, 0);
+    return current().calls.reduce((sum, c) => sum + c.promptTokens + c.completionTokens, 0);
   }
 
   get llmMs(): number {
-    return this.calls.reduce((sum, c) => sum + c.durationMs, 0);
+    return current().calls.reduce((sum, c) => sum + c.durationMs, 0);
   }
 
   get totalMs(): number {
-    return this.steps.reduce((sum, s) => sum + s.durationMs, 0);
+    return current().steps.reduce((sum, s) => sum + s.durationMs, 0);
   }
 
   get callCount(): number {
-    return this.calls.length;
+    return current().calls.length;
   }
 
   report(): string {
-    if (this.steps.length === 0) return "(метрик нема)";
+    const { steps, calls } = current();
+    if (steps.length === 0) return "(метрик нема)";
+
+    const totalMs = steps.reduce((sum, s) => sum + s.durationMs, 0);
+    const totalTokens = calls.reduce((sum, c) => sum + c.promptTokens + c.completionTokens, 0);
+    const llmMs = calls.reduce((sum, c) => sum + c.durationMs, 0);
 
     const lines = [
-      `всього ${this.totalMs} мс · викликів моделі ${this.calls.length} · ` +
-        `токенів ${this.totalTokens} (з них у моделі ${this.llmMs} мс)`,
+      `всього ${totalMs} мс · викликів моделі ${calls.length} · ` +
+        `токенів ${totalTokens} (з них у моделі ${llmMs} мс)`,
       "",
     ];
 
-    for (const step of this.steps) {
-      const stepCalls = this.calls.filter((c) => c.step === step.step);
+    for (const step of steps) {
+      const stepCalls = calls.filter((c) => c.step === step.step);
       const tokens = stepCalls.reduce((s, c) => s + c.promptTokens + c.completionTokens, 0);
-      const share = this.totalMs > 0 ? Math.round((step.durationMs / this.totalMs) * 100) : 0;
+      const share = totalMs > 0 ? Math.round((step.durationMs / totalMs) * 100) : 0;
 
       lines.push(
         `  ${step.node.padEnd(10)} ${String(step.durationMs).padStart(6)} мс  ` +

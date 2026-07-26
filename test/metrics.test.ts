@@ -99,3 +99,54 @@ describe("metrics", () => {
     assert.match(metrics.report(), /викликів моделі 2 · токенів 12/);
   });
 });
+
+describe("ізоляція лічильників між паралельними проходами", () => {
+  it("два одночасні проходи не перемішують кроки й токени", async () => {
+    // Раніше лічильники були одним об'єктом на процес: два паралельні
+    // ask() складали свої кроки в спільну купу, і звіт ставав вигадкою.
+    const run = (node: string, tokens: number, delayMs: number) =>
+      metrics.runIsolated(async () => {
+        await instrument(node, async () => {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          metrics.recordCall({ model: "m", promptTokens: tokens, completionTokens: 0, durationMs: 1 });
+          return null;
+        })({});
+        return { tokens: metrics.totalTokens, report: metrics.report() };
+      });
+
+    const [first, second] = await Promise.all([run("alpha", 100, 20), run("beta", 7, 5)]);
+
+    assert.equal(first!.tokens, 100);
+    assert.equal(second!.tokens, 7);
+    assert.ok(first!.report.includes("alpha") && !first!.report.includes("beta"));
+    assert.ok(second!.report.includes("beta") && !second!.report.includes("alpha"));
+  });
+
+  it("ізольований прохід не чіпає зовнішні лічильники", async () => {
+    metrics.reset();
+    await instrument("зовні", async () => {
+      metrics.recordCall({ model: "m", promptTokens: 5, completionTokens: 0, durationMs: 1 });
+      return null;
+    })({});
+
+    await metrics.runIsolated(async () => {
+      metrics.recordCall({ model: "m", promptTokens: 999, completionTokens: 0, durationMs: 1 });
+    });
+
+    assert.equal(metrics.totalTokens, 5);
+  });
+
+  it("кожен ізольований прохід нумерує кроки з нуля", async () => {
+    const stepsOf = () =>
+      metrics.runIsolated(async () => {
+        await instrument("a", async () => null)({});
+        await instrument("b", async () => null)({});
+        return metrics.report();
+      });
+
+    const first = await stepsOf();
+    const second = await stepsOf();
+
+    assert.equal(first.split("\n").length, second.split("\n").length);
+  });
+});

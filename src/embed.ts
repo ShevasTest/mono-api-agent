@@ -14,9 +14,21 @@ export const EMBEDDING_DIM = 384;
 let extractor: FeatureExtractionPipeline | null = null;
 
 async function getExtractor(): Promise<FeatureExtractionPipeline> {
-  if (!extractor) {
+  if (extractor) return extractor;
+
+  try {
     extractor = await pipeline("feature-extraction", EMBEDDING_MODEL, { dtype: "q8" });
+  } catch (error) {
+    // Перший запуск тягне ~25 МБ з HuggingFace. Якщо мережі нема або хаб
+    // недоступний, сирий стек transformers.js людині нічого не пояснює.
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `не вдалося підготувати модель ембедингів ${EMBEDDING_MODEL}: ${detail}\n` +
+        "Перший запуск качає ~25 МБ з huggingface.co — перевір мережу й доступ до хабу. " +
+        "Модель кешується, далі інтернет уже не потрібен.",
+    );
   }
+
   return extractor;
 }
 
